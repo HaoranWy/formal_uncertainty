@@ -92,8 +92,7 @@ def process_folio(limit=None):
 def process_proofwriter(limit=None):
     print(f"Processing ProofWriter (Limit: {'ALL' if limit is None else limit})...")
     try:
-        # --- FIX: 将配置名从 'owa' 改为 'default' ---
-        # 错误信息提示 Available: ['default']，所以必须用 default
+        # 使用 default 配置
         ds = load_dataset("/data/newmodel/uncertainty/datasets/proofwriter", "default", split="validation")
     except Exception as e:
         print(f"⚠️ Could not download ProofWriter: {e}")
@@ -101,33 +100,61 @@ def process_proofwriter(limit=None):
 
     processed = []
     
-    # 筛选逻辑：ProofWriter 包含不同 depth 的数据
-    # 论文复现通常关注较难的推理，这里保留 depth <= 5 的过滤逻辑
-    target_ds = [x for x in ds if x['depth'] <= 5]
+    # --- FIX START: 安全的过滤逻辑 ---
+    # 检查第一条数据是否包含 'depth' 字段
+    if len(ds) > 0 and 'depth' in ds[0]:
+        target_ds = [x for x in ds if x['depth'] <= 5]
+    else:
+        # 如果没有 depth 字段，则跳过过滤，直接使用全部数据
+        # print("⚠️ 'depth' field not found in dataset, skipping depth filtering.")
+        target_ds = ds
+    # --- FIX END ---
     
     for item in tqdm(target_ds, desc="Formatting ProofWriter"):
         # ProofWriter 的 theory 是一句话包含多个规则，用 '.' 分割
-        context_parts = [sent for sent in item['theory'].split('.') if sent.strip()]
-        # 加入 facts (triples)
-        for triple in item['triples'].values():
-             context_parts.append(triple)
+        # 注意：有时候 theory 字段可能为空，做个简单判断
+        theory_str = item.get('theory', '')
+        context_parts = [sent for sent in theory_str.split('.') if sent.strip()]
         
-        # 重新组合成 context 字符串
+        # 加入 facts (triples)
+        # 注意：triples 有时候可能是 list 而不是 dict，视具体版本而定
+        # default 配置下通常是 dict: {"0": "...", "1": "..."}
+        triples = item.get('triples', {})
+        if isinstance(triples, dict):
+            for triple in triples.values():
+                 context_parts.append(triple)
+        elif isinstance(triples, list):
+            for triple in triples:
+                context_parts.append(triple)
+        
         context_str = ". ".join(context_parts) + "."
 
         # 处理该条目下的所有问题
-        for q_key, q_val in item['questions'].items():
-            ans_str = str(q_val['answer'])
+        questions = item.get('questions', {})
+        # default 配置下 questions 通常也是 dict
+        if isinstance(questions, dict):
+            iterator = questions.items()
+        elif isinstance(questions, list):
+            # 某些版本可能是 list of dicts
+            iterator = enumerate(questions)
+        else:
+            continue
+
+        for q_key, q_val in iterator:
+            # 兼容 list 结构的情况
+            if not isinstance(q_val, dict): 
+                continue
+                
+            ans_str = str(q_val.get('answer', 'Unknown'))
             
-            # 过滤掉 'Unknown'，只保留二元真值 (True/False)
-            # 这在 Open World Assumption (OWA) 中很关键
+            # 只保留二元真值
             if ans_str not in ['True', 'False']:
                 continue
             
             processed.append({
                 "id": f"pw_{item['id']}_{q_key}",
                 "dataset": "proofwriter",
-                "question": q_val['question'],
+                "question": q_val.get('question', ''),
                 "context": context_str,
                 "answer": (ans_str == 'True'),
                 "answer_key": ans_str
@@ -138,7 +165,6 @@ def process_proofwriter(limit=None):
         processed = random.sample(processed, limit)
         
     return processed
-
 
 def process_prontoqa(limit=None):
     print(f"Processing ProntoQA (Limit: {'ALL' if limit is None else limit})...")
@@ -163,7 +189,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="/data/newmodel/uncertainty/formal_uncertainty/data/processed", help="Directory to save processed files")
     parser.add_argument("--full", action="store_true", help="Process the FULL dataset instead of sampling")
-    parser.add_argument("--sample_size", type=int, default=200, help="Sample size if --full is NOT specified")
+    parser.add_argument("--sample_size", type=int, default=100, help="Sample size if --full is NOT specified")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
