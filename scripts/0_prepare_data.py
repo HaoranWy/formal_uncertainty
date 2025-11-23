@@ -89,27 +89,38 @@ def process_folio(limit=None):
     if limit is not None and limit < len(processed):
         processed = random.sample(processed, limit)
     return processed
-
 def process_proofwriter(limit=None):
-    print(f"Processing ProofWriter OWA (Limit: {'ALL' if limit is None else limit})...")
+    print(f"Processing ProofWriter (Limit: {'ALL' if limit is None else limit})...")
     try:
-        ds = load_dataset("/data/newmodel/uncertainty/datasets/proofwriter", "owa", split="validation")
+        # --- FIX: 将配置名从 'owa' 改为 'default' ---
+        # 错误信息提示 Available: ['default']，所以必须用 default
+        ds = load_dataset("/data/newmodel/uncertainty/datasets/proofwriter", "default", split="validation")
     except Exception as e:
         print(f"⚠️ Could not download ProofWriter: {e}")
         return []
 
     processed = []
+    
+    # 筛选逻辑：ProofWriter 包含不同 depth 的数据
+    # 论文复现通常关注较难的推理，这里保留 depth <= 5 的过滤逻辑
     target_ds = [x for x in ds if x['depth'] <= 5]
     
-    # 这里原本没有用 idx，所以不需要 enumerate，但加上 tqdm 进度条
     for item in tqdm(target_ds, desc="Formatting ProofWriter"):
+        # ProofWriter 的 theory 是一句话包含多个规则，用 '.' 分割
         context_parts = [sent for sent in item['theory'].split('.') if sent.strip()]
+        # 加入 facts (triples)
         for triple in item['triples'].values():
              context_parts.append(triple)
+        
+        # 重新组合成 context 字符串
         context_str = ". ".join(context_parts) + "."
 
+        # 处理该条目下的所有问题
         for q_key, q_val in item['questions'].items():
             ans_str = str(q_val['answer'])
+            
+            # 过滤掉 'Unknown'，只保留二元真值 (True/False)
+            # 这在 Open World Assumption (OWA) 中很关键
             if ans_str not in ['True', 'False']:
                 continue
             
@@ -122,9 +133,12 @@ def process_proofwriter(limit=None):
                 "answer_key": ans_str
             })
 
+    # 采样逻辑
     if limit is not None and limit < len(processed):
         processed = random.sample(processed, limit)
+        
     return processed
+
 
 def process_prontoqa(limit=None):
     print(f"Processing ProntoQA (Limit: {'ALL' if limit is None else limit})...")
