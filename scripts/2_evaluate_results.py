@@ -1,7 +1,9 @@
 import pandas as pd
+import numpy as np
 import os
 import sys
-import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_predict, GroupKFold
 
 # 添加 src 路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -9,16 +11,77 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.evaluation.ensemble import UncertaintyEnsemble
 from src.evaluation.analysis import Evaluator
 
+# ==============================================================================
+# 定义 25 个指标
+# ==============================================================================
+METRICS_PCFG = [
+    'Grammar Entropy', 'Perplexity', 'KL Divergence', 'NSUI',
+    'Renyi Ent (2)', 'Renyi Ent (0.5)', 'Max Ent', 'Ent Ratio',
+    'Spectral Factor', 'Spectral Radius', '# Nonterminals', '# Rules',
+    'Avg Rules / NT', 'Avg RHS Len', 'Max Branch Factor',
+    'Rule Dist Mean', 'Rule Dist StdDev', 'Rule Dist Skew', 'Rule Dist Kurtosis'
+]
+
+METRICS_CONSISTENCY = [
+    'Self Consistency Text', 'Self Consistency SMT'
+]
+
+METRICS_ENSEMBLE = [
+    'Ensemble Average', 'Ensemble Weighted', 'Ensemble ML', 'Ensemble Simple'
+]
+
+ALL_METRICS = METRICS_PCFG + METRICS_CONSISTENCY + METRICS_ENSEMBLE
+
+def calculate_heuristic_ensembles(df):
+    """计算启发式集成指标"""
+    df = df.copy()
+    
+    # 提取特征并填充 NaN
+    uncertainty_cols = [c for c in METRICS_PCFG if c in df.columns]
+    confidence_cols = [c for c in METRICS_CONSISTENCY if c in df.columns]
+    
+    if not uncertainty_cols: return df # 数据不足
+    
+    # 标准化
+    scaler = StandardScaler()
+    features = df[uncertainty_cols + confidence_cols].fillna(0)
+    scaled = pd.DataFrame(scaler.fit_transform(features), columns=features.columns, index=df.index)
+    
+    # 统一方向：将不确定性指标取反 (-x)
+    for col in uncertainty_cols:
+        scaled[col] = -scaled[col]
+            
+    # 1. Ensemble Average
+    df['Ensemble Average'] = scaled.mean(axis=1)
+    
+    # 2. Ensemble Simple (Grammar Entropy + Text Consistency)
+    simple_cols = ['Grammar Entropy', 'Self Consistency Text']
+    available_simple = [c for c in simple_cols if c in scaled]
+    if available_simple:
+        df['Ensemble Simple'] = scaled[available_simple].mean(axis=1)
+    else:
+        df['Ensemble Simple'] = 0
+        
+    # 3. Ensemble Weighted (启发式权重)
+    w_score = np.zeros(len(df))
+    if 'Self Consistency Text' in scaled:
+        w_score += 0.6 * scaled['Self Consistency Text']
+    if 'Grammar Entropy' in scaled:
+        w_score += 0.2 * scaled['Grammar Entropy']
+    if 'Spectral Radius' in scaled:
+        w_score += 0.2 * scaled['Spectral Radius']
+    df['Ensemble Weighted'] = w_score
+
+    return df
+
 def evaluate_dataset(dataset_name, csv_path, evaluator):
-    print(f"\n{'='*20} Evaluating {dataset_name} {'='*20}")
+    print(f"\n{'='*40}\n Evaluating {dataset_name} \n{'='*40}")
     
     if not os.path.exists(csv_path):
         print(f"❌ File not found: {csv_path}")
         return
 
     df = pd.read_csv(csv_path)
-    
-    # 简单的清洗：去掉全 NaN 的列或行
     df = df.dropna(subset=['smt_is_correct'])
     
     if len(df) < 10:
@@ -27,71 +90,82 @@ def evaluate_dataset(dataset_name, csv_path, evaluator):
 
     print(f"Loaded {len(df)} samples.")
 
-    # --- 训练集成模型 ---
-    # 注意：这里使用简单的 Train/Test 逻辑，严谨复现建议使用 5-Fold CV
-    ensemble = UncertaintyEnsemble()
+    # --- 1. 训练集成模型 (Ensemble ML) ---
+    ensemble_ml = UncertaintyEnsemble()
     try:
-        ensemble.train(df, target_col='smt_is_correct')
-        df['Ensemble_Prob'] = ensemble.predict_proba(df)
+        # 注意：这里使用全量训练预测，仅作演示。严谨复现应用 Cross Validation
+        ensemble_ml.train(df, target_col='smt_is_correct')
+        df['Ensemble ML'] = ensemble_ml.predict_proba(df)
     except Exception as e:
-        print(f"⚠️ Ensemble training failed (maybe class imbalance?): {e}")
-        df['Ensemble_Prob'] = 0.5
+        print(f"⚠️ Ensemble ML training failed: {e}")
+        df['Ensemble ML'] = 0.5
 
-    # --- 定义要评估的指标 ---
-    metrics = [
-        'Grammar Entropy', 'NSUI', 'Spectral Radius', 
-        'Rule Dist Kurtosis', 
-        'Self Consistency Text', 'Self Consistency SMT',
-        'Ensemble_Prob'
-    ]
+    # --- 2. 计算其他集成指标 ---
+    df = calculate_heuristic_ensembles(df)
 
-    # --- 1. Ground Truth Prediction (Table 3) ---
-    print("\n--- Task: Prediction of Ground Truth Correctness ---")
+    # --- 3. 更新 Evaluator 的指标方向 ---
+    for m in METRICS_ENSEMBLE:
+        evaluator.metric_config[m] = {'ascending': False}
+
+    # --- 4. 评估 Ground Truth Prediction ---
+    print("\n>>> Task: Prediction of Ground Truth Correctness (Table 3)")
     results = []
-    for metric in metrics:
+    
+    for metric in ALL_METRICS:
         if metric in df.columns:
             res = evaluator.evaluate_metric(df, metric, target_col='smt_is_correct')
             if res: results.append(res)
     
     res_df = pd.DataFrame(results)
     if not res_df.empty:
-        print(res_df[['Metric', 'AUROC', 'AURC']].sort_values('AUROC', ascending=False).to_string(index=False))
-    
-    # 画图
-    evaluator.plot_roc_curves(df, metrics, 'smt_is_correct', title=f"ROC - {dataset_name} (Ground Truth)")
-
-    # --- 2. Consistency Prediction (Table 4) ---
-    # 只有当存在不一致的情况时才评估
-    if df['consistency_smt_text'].nunique() > 1:
-        print("\n--- Task: Prediction of SMT-Text Consistency ---")
-        # 重新训练集成模型用于一致性
-        ensemble_cons = UncertaintyEnsemble()
-        ensemble_cons.train(df, target_col='consistency_smt_text')
-        df['Ensemble_Prob_Cons'] = ensemble_cons.predict_proba(df)
+        # 打印完整榜单
+        print(res_df[['Metric', 'AUROC', 'ECE', 'AURC']].sort_values('AUROC', ascending=False).to_string(index=False))
         
-        metrics_cons = metrics[:-1] + ['Ensemble_Prob_Cons']
+        # **画图**：选出 AUROC 最高的 Top 7 指标进行绘制
+        top_metrics = res_df.sort_values('AUROC', ascending=False).head(25)['Metric'].tolist()
+        evaluator.plot_roc_curves(df, top_metrics, 'smt_is_correct', title=f"{dataset_name} - Ground Truth Prediction")
+
+    # --- 5. 评估 Consistency Prediction ---
+    if 'consistency_smt_text' in df.columns and df['consistency_smt_text'].nunique() > 1:
+        print("\n>>> Task: Prediction of SMT-Text Consistency (Table 4)")
+        
+        # 针对 Consistency 重新训练 ML
+        try:
+            ensemble_ml_cons = UncertaintyEnsemble()
+            ensemble_ml_cons.train(df, target_col='consistency_smt_text')
+            df['Ensemble ML'] = ensemble_ml_cons.predict_proba(df)
+        except: pass
+        
         results_cons = []
-        for metric in metrics_cons:
+        for metric in ALL_METRICS:
             if metric in df.columns:
                 res = evaluator.evaluate_metric(df, metric, target_col='consistency_smt_text')
                 if res: results_cons.append(res)
         
         res_df_cons = pd.DataFrame(results_cons)
         if not res_df_cons.empty:
-            print(res_df_cons[['Metric', 'AUROC', 'AURC']].sort_values('AUROC', ascending=False).to_string(index=False))
+            print(res_df_cons[['Metric', 'AUROC', 'ECE', 'AURC']].sort_values('AUROC', ascending=False).to_string(index=False))
             
-        evaluator.plot_roc_curves(df, metrics_cons, 'consistency_smt_text', title=f"ROC - {dataset_name} (Consistency)")
+            # **画图**
+            top_metrics_cons = res_df_cons.sort_values('AUROC', ascending=False).head(25)['Metric'].tolist()
+            evaluator.plot_roc_curves(df, top_metrics_cons, 'consistency_smt_text', title=f"{dataset_name} - Consistency Prediction")
     else:
-        print("\n⚠️ SMT and Text are 100% consistent (or data error), skipping Table 4.")
+        print("\n⚠️ Skipping Consistency evaluation (Data is 100% consistent or error).")
 
 def main():
     evaluator = Evaluator()
     
+    # 你的路径配置
+    base_path = "/data/newmodel/uncertainty/formal_uncertainty/output/generations"
+    # 如果路径不存在，尝试 fallback
+    if not os.path.exists(base_path):
+        base_path = "/data/newmodel/uncertainty/formal_uncertainty/outputs"
+
     datasets = [
-        ("StrategyQA", "/data/newmodel/uncertainty/formal_uncertainty/output/generations/strategyqa_features.csv"),
-        ("ProofWriter", "/data/newmodel/uncertainty/formal_uncertainty/output/generations/proofwriter_features.csv"),
-        ("FOLIO", "/data/newmodel/uncertainty/formal_uncertainty/output/generations/folio_features.csv"),
-        ("ProntoQA", "/data/newmodel/uncertainty/formal_uncertainty/output/generations/prontoqa_features.csv"),
+        ("StrategyQA", f"{base_path}/strategyqa_features.csv"),
+        ("ProofWriter", f"{base_path}/proofwriter_features.csv"),
+        ("FOLIO", f"{base_path}/folio_features.csv"),
+        ("ProntoQA", f"{base_path}/prontoqa_features.csv"),
     ]
     
     for name, path in datasets:

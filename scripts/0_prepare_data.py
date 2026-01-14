@@ -93,7 +93,7 @@ def process_proofwriter(limit=None):
     print(f"Processing ProofWriter (Limit: {'ALL' if limit is None else limit})...")
     try:
         # 使用 default 配置
-        ds = load_dataset("/data/newmodel/uncertainty/datasets/proofwriter", "default", split="validation")
+        ds = load_dataset("/data/newmodel/uncertainty/datasets/proofwriter_processed_OWA", "depth-5", split="test")
     except Exception as e:
         print(f"⚠️ Could not download ProofWriter: {e}")
         return []
@@ -111,43 +111,47 @@ def process_proofwriter(limit=None):
     # --- FIX END ---
     
     for item in tqdm(target_ds, desc="Formatting ProofWriter"):
-        # ProofWriter 的 theory 是一句话包含多个规则，用 '.' 分割
-        # 注意：有时候 theory 字段可能为空，做个简单判断
         theory_str = item.get('theory', '')
         context_parts = [sent for sent in theory_str.split('.') if sent.strip()]
         
-        # 加入 facts (triples)
-        # 注意：triples 有时候可能是 list 而不是 dict，视具体版本而定
-        # default 配置下通常是 dict: {"0": "...", "1": "..."}
+        # --- FIX START: 处理 triples 中的字典类型 ---
         triples = item.get('triples', {})
+        
+        # 定义一个内部帮助函数来提取文本
+        def extract_triple_text(t):
+            if isinstance(t, str):
+                return t
+            elif isinstance(t, dict):
+                # 尝试获取 'text' 字段，如果没有则获取第一个值，否则转字符串
+                return t.get('text', list(t.values())[0] if t else str(t))
+            return str(t)
+
         if isinstance(triples, dict):
             for triple in triples.values():
-                 context_parts.append(triple)
+                 context_parts.append(extract_triple_text(triple))
         elif isinstance(triples, list):
             for triple in triples:
-                context_parts.append(triple)
+                context_parts.append(extract_triple_text(triple))
+        # --- FIX END ---
         
+        # 确保所有元素都是字符串后再 join
+        context_parts = [str(part) for part in context_parts] 
         context_str = ". ".join(context_parts) + "."
 
-        # 处理该条目下的所有问题
         questions = item.get('questions', {})
-        # default 配置下 questions 通常也是 dict
         if isinstance(questions, dict):
             iterator = questions.items()
         elif isinstance(questions, list):
-            # 某些版本可能是 list of dicts
             iterator = enumerate(questions)
         else:
             continue
 
         for q_key, q_val in iterator:
-            # 兼容 list 结构的情况
             if not isinstance(q_val, dict): 
                 continue
                 
             ans_str = str(q_val.get('answer', 'Unknown'))
             
-            # 只保留二元真值
             if ans_str not in ['True', 'False']:
                 continue
             
@@ -160,7 +164,6 @@ def process_proofwriter(limit=None):
                 "answer_key": ans_str
             })
 
-    # 采样逻辑
     if limit is not None and limit < len(processed):
         processed = random.sample(processed, limit)
         

@@ -38,8 +38,8 @@ def generate_mock_data(n_samples=500):
 
 def main():
     # 1. 加载数据
-    # df = pd.read_csv("outputs/all_features.csv")
-    df = generate_mock_data()
+    df = pd.read_csv("outputs/all_features.csv")
+    # df = generate_mock_data()
     print(f"Loaded data with {len(df)} samples.")
 
     # 2. 训练集成模型 (Leave-One-Out 或 Train/Test Split 均可，这里用简单的 Train/Test)
